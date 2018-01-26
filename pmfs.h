@@ -279,6 +279,11 @@ struct pmfs_inode_info {
 	__u32   i_dir_start_lookup;
 	struct list_head i_truncated;
 	struct inode	vfs_inode;
+	struct vm_struct *area;
+	void *i_virt_addr;/*Inode's virtual addree*/
+	pte_t **ptes;
+	unsigned long *i_pfns;/*PFNs of file blocks*/
+	unsigned long num_pfns_mapped_in_va;/*The number of pfns that is mapped in i_virt_addr, this value is updated only when the file is first opened, the actual file size may grow as a result of write operation, so this value should be updated when the file is appened*/
 };
 
 /*
@@ -660,5 +665,12 @@ int pmfs_search_dirblock(u8 *blk_base, struct inode *dir, struct qstr *child,
 #define	PMFS_CLEAR_STATS	0xBCD00011
 void pmfs_print_timing_stats(void);
 void pmfs_clear_stats(void);
+
+extern void map_vmalloc_range(unsigned long *pfns, unsigned long pfn_num);
+/*For file larger than 1G, we use page talbe to read*/
+#define PMFS_FILE_SIZE_THRESHOLD (1 * 1024)  //1G
+
+extern int pmfs_map_va(struct inode *inode);
+extern int pmfs_get_file_pfns(struct inode *inode);
 
 #endif /* __PMFS_H */

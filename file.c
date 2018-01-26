@@ -20,6 +20,7 @@
 #include <linux/mm.h>
 #include <linux/uaccess.h>
 #include <linux/falloc.h>
+#include <linux/vmalloc.h>
 #include <asm/mman.h>
 #include "pmfs.h"
 #include "xip.h"
@@ -254,6 +255,8 @@ persist:
 static int pmfs_flush(struct file *file, fl_owner_t id)
 {
 	int ret = 0;
+
+
 	/* if the file was opened for writing, make it persistent.
 	 * TODO: Should we be more smart to check if the file was modified? */
 	if (file->f_mode & FMODE_WRITE) {
@@ -264,77 +267,94 @@ static int pmfs_flush(struct file *file, fl_owner_t id)
 	return ret;
 }
 
-#if 0
-static unsigned long
-pmfs_get_unmapped_area(struct file *file, unsigned long addr,
-			unsigned long len, unsigned long pgoff,
-			unsigned long flags)
+static int pmfs_file_release(struct inode *inode, struct file *file)
 {
-	unsigned long align_size;
-	struct vm_area_struct *vma;
-	struct mm_struct *mm = current->mm;
-	struct inode *inode = file->f_mapping->host;
-	struct pmfs_inode *pi = pmfs_get_inode(inode->i_sb, inode->i_ino);
-	struct vm_unmapped_area_info info;
-
-	if (len > TASK_SIZE)
-		return -ENOMEM;
-
-	if (pi->i_blk_type == PMFS_BLOCK_TYPE_1G)
-		align_size = PUD_SIZE;
-	else if (pi->i_blk_type == PMFS_BLOCK_TYPE_2M)
-		align_size = PMD_SIZE;
-	else
-		align_size = PAGE_SIZE;
-
-	if (flags & MAP_FIXED) {
-		/* FIXME: We could use 4K mappings as fallback. */
-		if (len & (align_size - 1))
-			return -EINVAL;
-		if (addr & (align_size - 1))
-			return -EINVAL;
-		return addr;
+	struct pmfs_inode_info *pi_info = PMFS_I(inode);
+	if (pi_info->i_virt_addr) {
+//		printk("In %s, free va:0x%lx\n", __FUNCTION__, (unsigned long)pi_info->i_virt_addr);
+		vfree(pi_info->i_pfns);
+		vfree(pi_info->ptes);
+		free_vm_area(pi_info->area);
+		pi_info->i_virt_addr = NULL;
 	}
 
-	if (addr) {
-		addr = ALIGN(addr, align_size);
-		vma = find_vma(mm, addr);
-		if (TASK_SIZE - len >= addr &&
-		    (!vma || addr + len <= vma->vm_start))
-			return addr;
-	}
-
-	/*
-	 * FIXME: Using the following values for low_limit and high_limit
-	 * implicitly disables ASLR. Awaiting a better way to have this fixed.
-	 */
-	info.flags = 0;
-	info.length = len;
-	info.low_limit = TASK_UNMAPPED_BASE;
-	info.high_limit = TASK_SIZE;
-	info.align_mask = align_size - 1;
-	info.align_offset = 0;
-	return vm_unmapped_area(&info);
+	return 0;
 }
-#endif
+
+inline  unsigned long  NUM_PAGES(unsigned long t)
+{
+	return (t >> 12) + (t % 4096 > 0 ? 1 : 0);
+}
+
+static int pmfs_malloc_va(size_t desired_size, struct inode *inode)
+{
+	struct pmfs_inode_info *pi_info = PMFS_I(inode);
+//	printk("In %s, required entry size=%lu\n", __FUNCTION__, (PAGE_ALIGN(desired_size) >> 12));
+	pi_info->i_pfns = (unsigned long *)vmalloc(sizeof(unsigned long) * (PAGE_ALIGN(desired_size) >> 12));
+	pi_info->ptes = (pte_t **)vmalloc(sizeof(pte_t *) * (PAGE_ALIGN(desired_size) >> 12));
+	pi_info->area = alloc_vm_area(PAGE_ALIGN(desired_size), pi_info->ptes);
+	if (pi_info->area) {
+		pi_info->i_virt_addr = pi_info->area->addr;
+//		printk("The allocated addr=0x%lx\n", (unsigned long)pi_info->i_virt_addr);
+		return 0;
+	}
+
+	return 1;
+}
+
+static int pmfs_file_open(struct inode *inode, struct file *filep)
+{
+	struct pmfs_inode_info *pi_info;
+	unsigned long size = 0;
+	char *p;
+	unsigned long i = 0;
+	unsigned long desired_size = 0;
+
+	pi_info = PMFS_I(inode);
+	pi_info->i_pfns = NULL;
+	pi_info->i_virt_addr = NULL;
+	pi_info->ptes = NULL;
+	pi_info->area = NULL;
+	pi_info->num_pfns_mapped_in_va = 0;
+
+	size = i_size_read(inode);
+	/*We double the space requirement for the existing file size*/
+	desired_size = i_size_read(inode) * 2;
+	if (size > PMFS_FILE_SIZE_THRESHOLD && !pi_info->i_virt_addr) {
+		if (pmfs_malloc_va(desired_size, inode)) {
+			printk("In %s, malloc va failed\n", __FUNCTION__);
+		}
+		pmfs_get_file_pfns(inode);
+		pmfs_map_va(inode);
+		//p = (char *)pi_info->i_virt_addr;
+		//printk("The file content:\n");
+		//for (i = 0; i < size;i++) {
+		//	printk("%c", p[i]+1);
+		//}
+	}
+
+	return generic_file_open(inode, filep);
+}
 
 const struct file_operations pmfs_xip_file_operations = {
-	.llseek			= pmfs_llseek,
-	.read			= pmfs_xip_file_read,
-	.write			= pmfs_xip_file_write,
-//	Pre 4.x.x era
-//	Either implement these or let user-apps know
-//	that this is unimplemented. For eg., MySQL needs aio.
-//	.aio_read		= xip_file_aio_read,
-//	.aio_write		= xip_file_aio_write,
-//	For 4.x and above but troubles NFS or anyone who uses thes *iter fn
-//	.read_iter		= generic_file_read_iter,
-//	.write_iter		= generic_file_write_iter,
-	.mmap			= pmfs_xip_file_mmap,
-// 	Can we avoid VFS if we don't call into generic_* routines ?
-	.open			= generic_file_open,
-	.fsync			= pmfs_fsync,
-	.flush			= pmfs_flush,
+	.llseek = pmfs_llseek,
+	.read = pmfs_xip_file_read,
+	.write = pmfs_xip_file_write,
+	//	Pre 4.x.x era
+	//	Either implement these or let user-apps know
+	//	that this is unimplemented. For eg., MySQL needs aio.
+	//	.aio_read		= xip_file_aio_read,
+	//	.aio_write		= xip_file_aio_write,
+	//	For 4.x and above but troubles NFS or anyone who uses thes *iter fn
+	//	.read_iter		= generic_file_read_iter,
+	//	.write_iter		= generic_file_write_iter,
+		.mmap = pmfs_xip_file_mmap,
+		// 	Can we avoid VFS if we don't call into generic_* routines ?
+			//.open			= generic_file_open,
+			.open = pmfs_file_open,
+			.fsync = pmfs_fsync,
+			.flush = pmfs_flush,
+		.release = pmfs_file_release,
 //	.get_unmapped_area	= pmfs_get_unmapped_area,
 	.unlocked_ioctl		= pmfs_ioctl,
 	.fallocate		= pmfs_fallocate,

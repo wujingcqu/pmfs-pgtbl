@@ -16,16 +16,43 @@
 #include <linux/buffer_head.h>
 #include <asm/cpufeature.h>
 #include <asm/pgtable.h>
+#include <linux/vmalloc.h>
 #include "pmfs.h"
 #include "xip.h"
 
+int pmfs_get_file_pfns(struct inode *inode)
+{
+	unsigned long block = 0, pos = 0;
+	unsigned long pfn = 0;
+	struct super_block *sb = inode->i_sb;
+	struct pmfs_inode_info *pi_info = PMFS_I(inode);
+	size_t isize = 0;
+
+	isize = i_size_read(inode);
+	do {
+		block = pmfs_find_data_block(inode, pos++);
+		pfn = pmfs_get_pfn(sb, block);
+		pi_info->i_pfns[pi_info->num_pfns_mapped_in_va++] = pfn;
+	} while ((pos << sb->s_blocksize_bits) < isize);
+
+	return 0;
+}
+
+int pmfs_map_va(struct inode *inode)
+{
+	int i = 0;
+	struct pmfs_inode_info *pi_info = PMFS_I(inode);
+
+	return map_va_with_ptes_and_pfns(pi_info->i_virt_addr, pi_info->ptes, pi_info->i_pfns, pi_info->num_pfns_mapped_in_va);
+}
+
 static ssize_t
 do_xip_mapping_read(struct address_space *mapping,
-		    struct file_ra_state *_ra,
-		    struct file *filp,
-		    char __user *buf,
-		    size_t len,
-		    loff_t *ppos)
+	struct file_ra_state *_ra,
+	struct file *filp,
+	char __user *buf,
+	size_t len,
+	loff_t *ppos)
 {
 	struct inode *inode = mapping->host;
 	pgoff_t index, end_index;
@@ -64,34 +91,35 @@ do_xip_mapping_read(struct address_space *mapping,
 			nr = len - copied;
 
 		error = pmfs_get_xip_mem(mapping, index, 0,
-					&xip_mem, &xip_pfn);
+			&xip_mem, &xip_pfn);
 		if (unlikely(error)) {
 			if (error == -ENODATA) {
 				/* sparse */
 				zero = 1;
-			} else
+			}
+			else
 				goto out;
 		}
 
 		/* If users can be writing to this page using arbitrary
-		 * virtual addresses, take care about potential aliasing
-		 * before reading the page on the kernel side.
-		 */
+		* virtual addresses, take care about potential aliasing
+		* before reading the page on the kernel side.
+		*/
 		if (mapping_writably_mapped(mapping))
-			/* address based flush */ ;
+			/* address based flush */;
 
 		/*
-		 * Ok, we have the mem, so now we can copy it to user space...
-		 *
-		 * The actor routine returns how many bytes were actually used..
-		 * NOTE! This may not be the same as how much of a user buffer
-		 * we filled up (we may be padding etc), so we can only update
-		 * "pos" here (the actor routine has to update the user buffer
-		 * pointers and the remaining count).
-		 */
+		* Ok, we have the mem, so now we can copy it to user space...
+		*
+		* The actor routine returns how many bytes were actually used..
+		* NOTE! This may not be the same as how much of a user buffer
+		* we filled up (we may be padding etc), so we can only update
+		* "pos" here (the actor routine has to update the user buffer
+		* pointers and the remaining count).
+		*/
 		PMFS_START_TIMING(memcpy_r_t, memcpy_time);
 		if (!zero)
-			left = __copy_to_user(buf+copied, xip_mem+offset, nr);
+			left = __copy_to_user(buf + copied, xip_mem + offset, nr);
 		else
 			left = __clear_user(buf + copied, nr);
 		PMFS_END_TIMING(memcpy_r_t, memcpy_time);
@@ -115,12 +143,57 @@ out:
 	return (copied ? copied : error);
 }
 
+static ssize_t
+do_xip_mapping_read_va(struct address_space *mapping,
+		    struct file *filp,
+		    char __user *buf,
+		    size_t len,
+		    loff_t *ppos)
+{
+	struct inode *inode = mapping->host;
+	loff_t isize, pos;
+	size_t copied = 0, error = 0;
+	struct pmfs_inode_info *pi_info = PMFS_I(inode);
+
+	pos = *ppos;
+	isize = i_size_read(inode);
+	if (!isize)
+		goto out;
+
+	if (len > isize - pos) {
+		len = isize - pos;
+	}
+	do {
+		unsigned long left = 0;
+
+		left = __copy_to_user(buf + copied, pi_info->i_virt_addr + copied + pos, len);
+		copied += (len - left);
+		if (left) {
+			error = -EFAULT;
+			goto out;
+		}
+
+	} while (copied < len);
+
+out:
+	*ppos = pos + copied;
+	if (filp)
+		file_accessed(filp);
+
+	return (copied ? copied : error);
+}
+
 ssize_t
 xip_file_read(struct file *filp, char __user *buf, size_t len, loff_t *ppos)
 {
+	struct inode *inode = filp->f_inode;
+	
 	if (!access_ok(VERIFY_WRITE, buf, len))
 		return -EFAULT;
-
+	
+	if (i_size_read(inode) >= PMFS_FILE_SIZE_THRESHOLD) {
+		return do_xip_mapping_read_va(filp->f_mapping, filp, buf, len, ppos);
+	}
 	return do_xip_mapping_read(filp->f_mapping, &filp->f_ra, filp,
 			    buf, len, ppos);
 }
@@ -135,13 +208,37 @@ ssize_t pmfs_xip_file_read(struct file *filp, char __user *buf,
 {
 	ssize_t res;
 	timing_t xip_read_time;
+	struct inode *inode = filp->f_inode;
+	struct pmfs_inode_info *pi_info = PMFS_I(inode);
+	unsigned long size = i_size_read(inode);
+	int i = 0;
+	char *p;
+	
+	//size = min((len + *ppos), size);
+	res = xip_file_read(filp, buf, len, ppos);
+	return res;
 
 	PMFS_START_TIMING(xip_read_t, xip_read_time);
 //	rcu_read_lock();
-	res = xip_file_read(filp, buf, len, ppos);
+	//res = xip_file_read(filp, buf, len, ppos);
+	printk("In %s, len=%lu, pos=%lu,size=%lu\n", __FUNCTION__, (unsigned long)len, (unsigned long)*ppos, size);
+	p = (char *)pi_info->i_virt_addr;
+	if (!access_ok(VERIFY_WRITE, buf, len)) {
+		printk("Access fault\n");
+	}
+	for (i = 0; i < i_size_read(inode);i++) {
+		//printk("%c", p[i]);
+		buf[i] = p[i];
+	}
+	printk("\n");
+
+	//res = __copy_to_user(buf, pi_info->i_virt_addr + *ppos, size);
+	*ppos += size;
+	if (filp)
+		file_accessed(filp);
 //	rcu_read_unlock();
 	PMFS_END_TIMING(xip_read_t, xip_read_time);
-	return res;
+	return 0;
 }
 
 static inline void pmfs_flush_edge_cachelines(loff_t pos, ssize_t len,
@@ -400,16 +497,16 @@ ssize_t pmfs_xip_file_write(struct file *filp, const char __user *buf,
 	if (max_logentries > MAX_METABLOCK_LENTRIES)
 		max_logentries = MAX_METABLOCK_LENTRIES;
 
-	trans = pmfs_new_transaction(sb, MAX_INODE_LENTRIES + max_logentries);
-	if (IS_ERR(trans)) {
-		ret = PTR_ERR(trans);
-		goto out;
-	}
-	pmfs_add_logentry(sb, trans, pi, MAX_DATA_PER_LENTRY, LE_DATA);
+	//trans = pmfs_new_transaction(sb, MAX_INODE_LENTRIES + max_logentries);
+	//if (IS_ERR(trans)) {
+	//	ret = PTR_ERR(trans);
+	//	goto out;
+	//}
+	//pmfs_add_logentry(sb, trans, pi, MAX_DATA_PER_LENTRY, LE_DATA);
 
 	ret = file_remove_privs(filp);
 	if (ret) {
-		pmfs_abort_transaction(sb, trans);
+		//pmfs_abort_transaction(sb, trans);
 		goto out;
 	}
 	inode->i_ctime = inode->i_mtime = CURRENT_TIME_SEC;
@@ -440,7 +537,7 @@ ssize_t pmfs_xip_file_write(struct file *filp, const char __user *buf,
 			" pos %llx start_blk %lx num_blocks %lx\n",
 			written, count, pos, start_blk, num_blocks);
 
-	pmfs_commit_transaction(sb, trans);
+	//pmfs_commit_transaction(sb, trans);
 	ret = written;
 out:
 	mutex_unlock(&inode->i_mutex);

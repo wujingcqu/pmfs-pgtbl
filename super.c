@@ -33,6 +33,8 @@
 #include <linux/backing-dev.h>
 #include <linux/list.h>
 #include <linux/types.h>
+#include <linux/vmalloc.h>
+
 #include "pmfs.h"
 
 int measure_timing = 0;
@@ -591,6 +593,73 @@ static void pmfs_recover_truncate_list(struct super_block *sb)
 	PERSISTENT_BARRIER();
 }
 
+#define MAX_GRANTS 16
+
+void map_vmalloc_range(unsigned long *pfns, unsigned long pfn_num)
+{
+	struct vm_struct *area;
+	void *addr;
+	unsigned long size = MAX_GRANTS * 4096;
+	pte_t *ptes[MAX_GRANTS];
+	int i = 0;
+	char *ch;
+
+	printk("\n\n************In %s**********\n", __FUNCTION__);
+	area = alloc_vm_area(size, ptes);
+	if (area) {
+		addr = area->addr;
+		ch = (char *)addr;
+		printk("The allocated addr=0x%lx\n", (unsigned long)addr);
+		set_pte_at(&init_mm, (unsigned long)addr, ptes[0], pfn_pte(pfns[0], PAGE_KERNEL));
+		for (i = 0; i < 4096 * pfn_num; i++) {
+			//printk("0x%lx,addr[%d]=%c\n", (unsigned long)&ch[i], i, ch[i]);
+		}
+		free_vm_area(area);
+	}
+	
+}
+
+static void test_va_malloc(void)
+{
+	struct vm_struct *area;
+	void *addr;
+	unsigned long real_size = 4 * 4096; //4k
+	pte_t *ptes[MAX_GRANTS];
+	int i = 0;
+	struct page *page;
+	char *ch;
+	unsigned long pfn;
+
+	printk("In %s\n", __FUNCTION__);
+	area = alloc_vm_area(real_size, ptes);
+	if (!area) {
+		printk("Failed to allocate vm area\n");
+	} else {
+		addr = area->addr;
+		ch = (char *)addr;
+		printk("The allocated addr=0x%lx\n", (unsigned long)addr);
+		for (i = 0; i < 4;i++) {
+			printk("pte[%d]=0x%lx", i, (unsigned long)ptes[i]);
+		}
+		page = alloc_page(GFP_KERNEL | __GFP_NOWARN | __GFP_HIGHMEM);
+		pfn = page_to_pfn(page);
+		printk("The pfn1=%lu\n", pfn);
+		set_pte_at(&init_mm, (unsigned long)addr, ptes[0], mk_pte(page, PAGE_KERNEL));
+
+		page = alloc_page(GFP_KERNEL | __GFP_NOWARN | __GFP_HIGHMEM);
+		pfn = page_to_pfn(page);
+		printk("The pfn2=%lu\n", pfn);
+		set_pte_at(&init_mm, (unsigned long)addr, ptes[1], mk_pte(page, PAGE_KERNEL));
+
+		for (i = 0; i < 5000;i++) {
+			ch[i] = i;
+			printk("0x%lx,addr[%d]=%d\n", (unsigned long)&ch[i], i, ch[i]);
+		}
+		//printk("The value is addr[0]=0x%x,addr[1]=0x%x\n", (char*)ch[0], (char*)ch[1]);
+	}
+}
+
+
 static int pmfs_fill_super(struct super_block *sb, void *data, int silent)
 {
 	struct pmfs_super_block *super;
@@ -603,6 +672,8 @@ static int pmfs_fill_super(struct super_block *sb, void *data, int silent)
 
 	BUILD_BUG_ON(sizeof(struct pmfs_super_block) > PMFS_SB_SIZE);
 	BUILD_BUG_ON(sizeof(struct pmfs_inode) > PMFS_INODE_SIZE);
+
+	//test_va_malloc();
 
 	if (arch_has_pcommit()) {
 		pmfs_info("arch has PCOMMIT support\n");
@@ -1092,6 +1163,8 @@ static const struct export_operations pmfs_export_ops = {
 	.fh_to_parent	= pmfs_fh_to_parent,
 	.get_parent	= pmfs_get_parent,
 };
+
+
 
 static int __init init_pmfs_fs(void)
 {
